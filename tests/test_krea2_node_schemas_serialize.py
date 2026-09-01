@@ -19,6 +19,8 @@ from pathlib import Path
 sys.path.insert(0, "/media/aikenyon/NVME_2/ubuntu_comfy/ComfyUI")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import comfy.samplers  # noqa: E402
+
 from krea2_image_and_text_encoder_node import Krea2Qwen3ImageAndTextEncoder  # noqa: E402
 from krea2_tiled_diffusion_node import Krea2TiledDiffusion  # noqa: E402
 
@@ -56,6 +58,19 @@ def main() -> int:
             serialise_error = str(exc)
         check(f"{name} serialises to JSON, so /object_info does not fail",
               serialised, serialise_error)
+
+    # ComfyUI's `simple` was MEASURED bit-exact to Krea 2's own schedule -
+    # sigma(linspace(1, 0, steps + 1)) at shift 1.15, from krea-2/sampling.py -
+    # against the real ModelSamplingFlux. A hand-rolled scheduler here would only
+    # be a chance to get that wrong again, which it already was.
+    tiling_schema = Krea2TiledDiffusion.define_schema()
+    scheduler_input = next(node_input for node_input in tiling_schema.inputs
+                           if getattr(node_input, "id", "") == "scheduler")
+    check("the scheduler defaults to simple, which IS Krea 2's own schedule",
+          scheduler_input.default == "simple", f"got {scheduler_input.default}")
+    check("no hand-rolled scheduler is offered alongside ComfyUI's",
+          set(scheduler_input.options) == set(comfy.samplers.SCHEDULER_NAMES),
+          f"extras: {set(scheduler_input.options) - set(comfy.samplers.SCHEDULER_NAMES)}")
 
     # A dropdown's options must be concrete values by the time the schema is
     # built. Passing the function that produces them is the specific mistake that

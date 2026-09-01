@@ -1,8 +1,7 @@
 """The Krea2 Tiled Diffusion sampler node.
 
-Applies the identity LoRA, installs the per-step tile fusion, builds the discrete
-sigma schedule, and samples. The tiling and the schedule are ours; ComfyUI does
-the sampling.
+Applies the identity LoRA, installs the per-step tile fusion, and samples. The
+tiling is ours; the schedule and the sampling are ComfyUI's.
 """
 from __future__ import annotations
 
@@ -17,7 +16,6 @@ import latent_preview
 import node_helpers
 from comfy_api.latest import io
 
-from krea2_discrete_sigmas import build_discrete_sigmas
 from krea2_rope_tile_offset import (
     TileRopeOffsetHolder,
     build_post_input_rope_offset_patch,
@@ -25,7 +23,6 @@ from krea2_rope_tile_offset import (
 from krea2_tile_planning import plan_latent_tiles
 from krea2_tiled_denoise import build_tiled_denoise_wrapper
 
-DISCRETE_SCHEDULER_NAME = "discrete"
 NO_LORA_SELECTED = "none"
 
 TILE_GRIDS = ["1x1", "1x2", "2x1", "2x2", "2x3", "3x2", "3x3"]
@@ -36,6 +33,10 @@ DEFAULT_TILE_OVERLAP_PIXELS = 256
 DEFAULT_STEPS = 8
 DEFAULT_DENOISE = 0.75
 DEFAULT_CFG = 1.0
+# Krea 2 builds its schedule as sigma(linspace(1, 0, steps + 1)) shifted by mu
+# (krea-2/sampling.py timesteps()). MEASURED bit-exact to ComfyUI's "simple"
+# against the real ModelSamplingFlux at shift 1.15.
+DEFAULT_SCHEDULER = "simple"
 
 
 def scale_conditioning(conditioning, multiplier: float):
@@ -122,11 +123,11 @@ class Krea2TiledDiffusion(io.ComfyNode):
                 io.Combo.Input("sampler_name", options=comfy.samplers.KSampler.SAMPLERS,
                                default="euler"),
                 io.Combo.Input("scheduler",
-                               options=[DISCRETE_SCHEDULER_NAME]
-                                       + list(comfy.samplers.SCHEDULER_NAMES),
-                               default=DISCRETE_SCHEDULER_NAME,
-                               tooltip="discrete is ported from the Krea 2 runtime; "
-                                       "ComfyUI does not ship one."),
+                               options=list(comfy.samplers.SCHEDULER_NAMES),
+                               default=DEFAULT_SCHEDULER,
+                               tooltip="simple is bit-exact to Krea 2's own "
+                                       "schedule at shift 1.15. normal collapses "
+                                       "its last step to near zero and wastes it."),
                 io.Float.Input("denoise", default=DEFAULT_DENOISE, min=0.0, max=1.0,
                                step=0.01,
                                tooltip="0.75 rebuilds at high resolution. 0.10 "
@@ -195,14 +196,9 @@ class Krea2TiledDiffusion(io.ComfyNode):
             model_for_this_run.set_model_patch(
                 build_post_input_rope_offset_patch(rope_offset_holder), "post_input")
 
-        model_sampling = model_for_this_run.get_model_object("model_sampling")
-        if scheduler == DISCRETE_SCHEDULER_NAME:
-            sigmas = build_discrete_sigmas(model_sampling, steps, denoise)
-        else:
-            sampler_helper = comfy.samplers.KSampler(
-                model_for_this_run, steps=steps, device=latent_samples.device,
-                sampler=sampler_name, scheduler=scheduler, denoise=denoise)
-            sigmas = sampler_helper.sigmas
+        sigmas = comfy.samplers.KSampler(
+            model_for_this_run, steps=steps, device=latent_samples.device,
+            sampler=sampler_name, scheduler=scheduler, denoise=denoise).sigmas
 
         noise = comfy.sample.prepare_noise(
             latent_samples, seed, upscaled_reference_image_latent.get("batch_index"))
