@@ -20,13 +20,34 @@ The approach was developed and measured in a
 where a per-finished-tile implementation was built, compared against this one,
 lost twice, and was deleted.
 
-## Defaults
+## Two recipes
 
-The defaults come from real generations, not from taste. `DESIGN.md` records two
-reference results, what they share, and where they disagree.
+The settings come from real generations, not from taste. There are **two** that
+work, and they are different jobs rather than two points on one scale — the
+middle ground between them is worse than either end.
 
-Notable ones: a 2x2 grid with 512px overlap, RoPE offsets per tile **on**, euler
-+ discrete, cfg 1, flow shift 1.15.
+|                | **High denoise** (default) | **Low denoise** |
+|----------------|---------------------------|-----------------|
+| what it does   | builds a new high-res image | enhances what is already there |
+| grid           | 2x2                       | 3x3             |
+| overlap        | 256px                     | 512px           |
+| steps          | 8                         | 4               |
+| denoise        | 0.75                      | 0.10            |
+| PAG            | off                       | on, scale 1, layers 7, window 0–1 |
+| vision         | on                        | on              |
+
+Shared by both: **euler** + **discrete**, cfg **1**, flow shift **1.15**, noise
+multiplier **1**, RoPE offsets per tile **on**. Either wants a turbo model or a
+turbo LoRA.
+
+The extra tiles and wider overlap earn their cost in the low denoise recipe,
+where the pass is not allowed to redraw much and tile coverage is doing the work.
+At 0.75 denoise a 2x2 grid at 256px overlap reaches an excellent result for 4
+model evaluations per step instead of 9.
+
+Do not split the difference on denoise. Pick a recipe.
+
+`DESIGN.md` records the individual reference generations behind both.
 
 ## Requirements
 

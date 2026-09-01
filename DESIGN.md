@@ -190,15 +190,19 @@ image with NO first stage sampled.
 They disagree on almost every axis. That disagreement is the most useful thing we
 have, because what they SHARE is what is actually carrying the result.
 
-                        REFERENCE A     REFERENCE B     REFERENCE C (newest,
-                        (1664x2432)     (1248x1824)      "excellent", 1248x1824)
-    grid                3x3             2x2             2x2
-    overlap             512 (504 real)  512             256
-    rope offsets        on              on              on
-    steps (executed)    4               8               8
-    denoise             0.1             0.75            0.75
-    PAG                 on, s1, layer7  OFF             OFF
-    hires vision input  none            img2img_source  img2img_source
+                        REF A           REF B           REF C           REF D
+                        (1664x2432)     (1248x1824)     (1248x1824)     (1664x2432)
+    grid                3x3             2x2             2x2             3x3
+    overlap             512 (504 real)  512             256             512 (504 real)
+    rope offsets        on              on              on              on
+    steps (executed)    4               8               8               4
+    denoise             0.1             0.75            0.75            0.1
+    PAG                 on, s1, layer7  OFF             OFF             on, s1, layer7
+    hires vision input  none            img2img_source  img2img_source  img2img_source
+
+    D is A with the vision actually reaching the hires pass, and with a turbo
+    MODEL in place of the turbo LoRA (DasiwaKrea2TurboRaw_cutedisasterV2Turbo,
+    identity edit LoRA only). It is the reference recipe for LOW DENOISE upscale.
 
     SHARED BY ALL THREE — treat as the load-bearing defaults
         sampler                 euler
@@ -239,17 +243,42 @@ Why 2x2 is the default even though 3x3 improves quality
     evaluations per step instead of 9. That is a cost choice, not a claim that
     3x3 is worthless. Raise the grid when the quality is worth the time.
 
-The two references are two different jobs, not two points on a scale
+TWO RECIPES, not two points on a scale
 
-    A is "slightly enhance what is already there". B is "build a new super HD
-    image". OBSERVED: the middle ground between them is hot garbage — worse than
-    either end, not a blend of them.
+    OBSERVED: the middle ground between them is hot garbage — worse than either
+    end, not a blend of them. They are different jobs.
 
-    This is documented as guidance, NOT enforced. No preset switch, no snapping,
-    no warning when a value lands between the two. Every setting is a plain field
-    and the user is trusted to drive it. The reason to write it down is that a
-    reasonable person would otherwise assume denoise interpolates sensibly
-    between these references, and it does not.
+    HIGH DENOISE — "build a new super HD image"   [Reference C, the DEFAULTS]
+        grid            2x2
+        overlap         256
+        steps           8
+        denoise         0.75
+        PAG             off
+        vision          on
+
+    LOW DENOISE — "slightly enhance what is already there"   [Reference D]
+        grid            3x3
+        overlap         512
+        steps           4
+        denoise         0.1
+        PAG             on, scale 1, layers 7, window 0-1
+        vision          on
+        More tiles and wider overlap earn their cost here, where the pass is not
+        allowed to redraw much and coverage is doing the work.
+
+    Both share euler + discrete, cfg 1, flow shift 1.15, noise multiplier 1,
+    RoPE offsets on. Either wants a turbo model or a turbo LoRA.
+
+    Documented as guidance, NOT enforced. No preset switch, no snapping, no
+    warning when a value lands between the two. Every setting is a plain field and
+    the user is trusted to drive it. It is written down because a reasonable
+    person would otherwise assume denoise interpolates sensibly between these, and
+    it does not.
+
+    SURFACE BOTH IN THE UI: the README carries both recipes, and the node should
+    make the low denoise recipe discoverable without leaving ComfyUI — a tooltip
+    or info box on the denoise widget. UNVERIFIED: what ComfyUI supports for
+    per-widget tooltips or an info affordance on a node.
 
     denoise: FLOAT, clamp 0.0-1.0, step 0.01. The clamp is there because the
     range is genuinely meaningless outside it, not to protect anyone.
