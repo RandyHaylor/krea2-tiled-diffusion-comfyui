@@ -73,6 +73,35 @@ def main() -> int:
           all(shape[0] == 2 and shape[1] == 16 for shape in tiles_seen),
           f"got {set((s[0], s[1]) for s in tiles_seen)}")
 
+    # Krea2's latent format is Wan21 and its forward branches on x.ndim == 5, so a
+    # latent arrives as (batch, channels, frames, height, width). Slicing fixed
+    # dimensions 2 and 3 would cut time and height instead of height and width.
+    temporal_latent = torch.randn(2, 16, 1, 228, 156)
+    temporal_fused = denoise_latent_as_fused_tiles(
+        returns_input_unchanged, temporal_latent, timestep=None, conditioning={},
+        plan=plan, rope_offset_holder=None)
+    check("a five dimensional latent fuses back to itself",
+          torch.allclose(temporal_fused, temporal_latent, atol=1e-5),
+          f"max deviation {float((temporal_fused - temporal_latent).abs().max()):.3e}")
+    check("a five dimensional latent keeps its shape",
+          temporal_fused.shape == temporal_latent.shape,
+          f"got {tuple(temporal_fused.shape)}")
+
+    temporal_tiles_seen = []
+    record_temporal_tiles = lambda tile, timestep, **conditioning: (
+        temporal_tiles_seen.append(tuple(tile.shape)) or tile)
+    denoise_latent_as_fused_tiles(record_temporal_tiles, temporal_latent,
+                                 timestep=None, conditioning={}, plan=plan,
+                                 rope_offset_holder=None)
+    check("five dimensional tiles are cut on height and width, not time",
+          all(shape[2] == 1 and shape[3] <= 228 and shape[4] <= 156
+              for shape in temporal_tiles_seen),
+          f"got {sorted(set(temporal_tiles_seen))}")
+    check("five dimensional tiles match the planned tile sizes",
+          {(shape[3], shape[4]) for shape in temporal_tiles_seen}
+          == {(tile.height, tile.width) for tile in plan.tiles},
+          f"got {sorted({(s[3], s[4]) for s in temporal_tiles_seen})}")
+
     single_tile_plan = plan_latent_tiles(latent_width=64, latent_height=64,
                                          tile_grid="1x1", tile_overlap_pixels=128)
     single_calls = []
@@ -85,9 +114,14 @@ def main() -> int:
     check("a single tile skips the fusion and calls the model once, whole",
           single_calls == [(1, 16, 64, 64)], f"got {single_calls}")
 
-    weight = build_tile_fusion_weight(8, 6, torch.device("cpu"), torch.float32)
+    weight = build_tile_fusion_weight(8, 6, 4, torch.device("cpu"), torch.float32)
     check("the fusion weight is shaped for broadcasting over batch and channels",
           tuple(weight.shape) == (1, 1, 8, 6), f"got {tuple(weight.shape)}")
+    temporal_weight = build_tile_fusion_weight(8, 6, 5, torch.device("cpu"),
+                                               torch.float32)
+    check("the fusion weight gains a leading axis for a five dimensional latent",
+          tuple(temporal_weight.shape) == (1, 1, 1, 8, 6),
+          f"got {tuple(temporal_weight.shape)}")
     check("the fusion weight is strictly positive everywhere",
           bool((weight > 0).all()), f"min {float(weight.min()):.6f}")
     check("the fusion weight is largest at the tile centre",

@@ -19,12 +19,14 @@ from krea2_rope_tile_offset import TileRopeOffsetHolder
 from krea2_tile_planning import LatentTilePlan, raised_cosine_taper
 
 
-def build_tile_fusion_weight(tile_height: int, tile_width: int,
+def build_tile_fusion_weight(tile_height: int, tile_width: int, latent_rank: int,
                              device, dtype) -> torch.Tensor:
-    """The separable raised cosine weight for one tile, shaped (1, 1, h, w).
+    """The separable raised cosine weight for one tile, shaped to broadcast.
 
     The runtime multiplies a per-column taper by a per-row taper
-    (stable-diffusion.cpp:3140), which is an outer product.
+    (stable-diffusion.cpp:3140), which is an outer product. Leading singleton
+    dimensions are added to match the latent's rank, so the same weight covers a
+    four dimensional image latent and the five dimensional one Krea2 uses.
     """
     row_taper = torch.tensor(
         [raised_cosine_taper(row, tile_height) for row in range(tile_height)],
@@ -32,7 +34,9 @@ def build_tile_fusion_weight(tile_height: int, tile_width: int,
     column_taper = torch.tensor(
         [raised_cosine_taper(column, tile_width) for column in range(tile_width)],
         device=device, dtype=dtype)
-    return torch.outer(row_taper, column_taper).reshape(1, 1, tile_height, tile_width)
+    leading_singletons = (1,) * max(0, latent_rank - 2)
+    return torch.outer(row_taper, column_taper).reshape(
+        *leading_singletons, tile_height, tile_width)
 
 
 def denoise_latent_as_fused_tiles(apply_model, latent: torch.Tensor,
@@ -54,8 +58,12 @@ def denoise_latent_as_fused_tiles(apply_model, latent: torch.Tensor,
     # sums, so a bf16 model's tiles do not lose the overlap to rounding.
     accumulation_dtype = torch.float32 if latent.dtype != torch.float64 else torch.float64
     accumulated = torch.zeros(latent.shape, device=latent.device, dtype=accumulation_dtype)
-    accumulated_weight = torch.zeros((1, 1, latent.shape[-2], latent.shape[-1]),
-                                     device=latent.device, dtype=accumulation_dtype)
+    # Only the last two dimensions are tiled. Krea2's latents carry a frame axis as
+    # well, so everything below indexes from the RIGHT rather than at fixed
+    # positions, and the weight is shaped to broadcast over whatever leads.
+    accumulated_weight = torch.zeros(
+        (1,) * (latent.ndim - 2) + tuple(latent.shape[-2:]),
+        device=latent.device, dtype=accumulation_dtype)
 
     for tile in plan.tiles:
         rows = slice(tile.row_start, tile.row_start + tile.height)
@@ -64,16 +72,16 @@ def denoise_latent_as_fused_tiles(apply_model, latent: torch.Tensor,
         if rope_offset_holder is not None:
             rope_offset_holder.set_to_tile_origin(tile.row_start, tile.column_start)
         try:
-            tile_prediction = apply_model(latent[:, :, rows, columns],
+            tile_prediction = apply_model(latent[..., rows, columns],
                                           timestep, **conditioning)
         finally:
             if rope_offset_holder is not None:
                 rope_offset_holder.clear()
 
-        weight = build_tile_fusion_weight(tile.height, tile.width,
+        weight = build_tile_fusion_weight(tile.height, tile.width, latent.ndim,
                                           latent.device, accumulation_dtype)
-        accumulated[:, :, rows, columns] += tile_prediction.to(accumulation_dtype) * weight
-        accumulated_weight[:, :, rows, columns] += weight
+        accumulated[..., rows, columns] += tile_prediction.to(accumulation_dtype) * weight
+        accumulated_weight[..., rows, columns] += weight
 
     fused = accumulated / accumulated_weight.clamp_min(torch.finfo(accumulation_dtype).tiny)
     return fused.to(latent.dtype)
