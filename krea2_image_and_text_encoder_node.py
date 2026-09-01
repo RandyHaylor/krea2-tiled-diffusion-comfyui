@@ -13,16 +13,14 @@ import comfy.utils
 from comfy_api.latest import io
 
 from krea2_prompt_template import (
+    DEFAULT_VISION_SIZE,
     build_krea2_conditioning_template_for_image_count,
     verify_template_matches_comfyui,
+    vision_pixel_budget_for_size,
 )
 
-# The vision tower is fed a fixed pixel budget rather than the image's own size,
-# matching what the other qwen3vl-family encode nodes do.
-VISION_PIXEL_BUDGET = 1024 * 1024
 
-
-def resize_image_to_vision_pixel_budget(image, pixel_budget: int = VISION_PIXEL_BUDGET):
+def resize_image_to_vision_pixel_budget(image, pixel_budget: int):
     """The image scaled to hold about `pixel_budget` pixels, keeping its aspect."""
     samples = image.movedim(-1, 1)
     scale = math.sqrt(pixel_budget / (samples.shape[3] * samples.shape[2]))
@@ -54,6 +52,11 @@ class Krea2Qwen3ImageAndTextEncoder(io.ComfyNode):
                 io.Image.Input(
                     "image", optional=True,
                     tooltip="Read by the vision tower. A batch is passed as several images."),
+                io.Int.Input(
+                    "vision_size", default=DEFAULT_VISION_SIZE, min=64, max=2048, step=64,
+                    tooltip="Each image is resized to about this many pixels square "
+                            "before the vision tower reads it. 512 is what the "
+                            "reference generations used."),
             ],
             outputs=[
                 io.Conditioning.Output(
@@ -62,14 +65,16 @@ class Krea2Qwen3ImageAndTextEncoder(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, clip, prompt, image=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, image=None,
+                vision_size=DEFAULT_VISION_SIZE) -> io.NodeOutput:
         stale_template_warning = verify_template_matches_comfyui()
         if stale_template_warning is not None:
             logging.warning("Krea2-Qwen3 Image and Text Encoder: %s", stale_template_warning)
 
         images_for_vision_tower = []
         if image is not None:
-            resized = resize_image_to_vision_pixel_budget(image)
+            resized = resize_image_to_vision_pixel_budget(
+                image, vision_pixel_budget_for_size(vision_size))
             images_for_vision_tower = [resized[index:index + 1]
                                        for index in range(resized.shape[0])]
 

@@ -10,10 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from krea2_prompt_template import (  # noqa: E402
+    DEFAULT_VISION_SIZE,
     KREA2_CONDITIONING_TEMPLATE,
     IMAGE_START_MARKER,
     build_krea2_conditioning_template_for_image_count,
     positions_of_conversation_turn_markers,
+    vision_pixel_budget_for_size,
 )
 
 failures: list[str] = []
@@ -37,6 +39,26 @@ def main() -> int:
     check("three images insert three vision blocks",
           build_krea2_conditioning_template_for_image_count(3)
           .count("<|vision_start|><|image_pad|><|vision_end|>") == 3)
+
+    # The working stable-diffusion.cpp runtime labels each vision image before its
+    # block: `"Picture " + std::to_string(i + 1) + ": <|vision_start|>"` in the
+    # krea2 branch of conditioner.hpp. Reproduce that exactly.
+    check("each vision block is labelled Picture N, numbered from one",
+          build_krea2_conditioning_template_for_image_count(3).count(
+              "Picture 1: <|vision_start|><|image_pad|><|vision_end|>"
+              "Picture 2: <|vision_start|><|image_pad|><|vision_end|>"
+              "Picture 3: <|vision_start|><|image_pad|><|vision_end|>") == 1,
+          build_krea2_conditioning_template_for_image_count(3))
+    check("no Picture label appears when there are no images",
+          "Picture" not in no_image_template)
+
+    # The runtime keeps ONE system prompt for krea2 whether or not images are
+    # attached; prompt_template_encode_start_idx stays 34 either way. Only other
+    # architectures swap in an edit-specific system prompt.
+    system_turn_of = lambda template: template.split("<|im_end|>", 1)[0]
+    check("the system turn is identical with and without images",
+          system_turn_of(no_image_template) == system_turn_of(one_image_template),
+          system_turn_of(one_image_template))
 
     # Krea2TEModel.encode_token_weights locates the end of the prefix by taking the
     # position of the SECOND conversation-turn marker and requiring "user\n" right
@@ -67,6 +89,14 @@ def main() -> int:
 
     check("a negative image count is refused rather than silently treated as zero",
           refuses_negative_image_count())
+
+    # vlm_size=N sets the runtime's min and max vision size to N, and the krea2
+    # preset resizes by AREA, where those bounds are squared. The reference
+    # generations ran at 512.
+    check("the vision pixel budget is the square of the requested size",
+          vision_pixel_budget_for_size(512) == 512 * 512)
+    check("the default vision size is the 512 the reference generations used",
+          DEFAULT_VISION_SIZE == 512)
 
     if failures:
         print(f"\n{len(failures)} failing checks:")

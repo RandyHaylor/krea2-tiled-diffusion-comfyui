@@ -18,6 +18,11 @@ IMAGE_START_MARKER = "<|im_start|>"
 
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
 
+# vlm_size=N sets the runtime's vision min and max size to N, and the krea2 preset
+# resizes by AREA, where both bounds are squared. Every reference generation ran at
+# 512, which is why that is the default rather than the runtime's unset max of 1024.
+DEFAULT_VISION_SIZE = 512
+
 # Copied from KREA2_TEMPLATE in comfy/text_encoders/krea2.py. `verify_template_matches_comfyui`
 # checks the copy against the installed ComfyUI when it can be imported.
 KREA2_CONDITIONING_TEMPLATE = (
@@ -43,19 +48,31 @@ def positions_of_conversation_turn_markers(template: str) -> list[int]:
         search_from = found + len(IMAGE_START_MARKER)
 
 
-def build_krea2_conditioning_template_for_image_count(image_count: int) -> str:
-    """Krea2's template with one vision block per image inside the user turn.
+def vision_pixel_budget_for_size(vision_size: int) -> int:
+    """The AREA budget the runtime derives from a vlm_size, which is its square."""
+    if vision_size <= 0:
+        raise ValueError(f"vision size must be positive: {vision_size}")
+    return vision_size * vision_size
 
-    The blocks go directly after the user turn opening and before the prompt slot,
-    which is where the qwen3vl image template puts them and, more importantly, on
-    the surviving side of the encoder's prefix cut.
+
+def build_krea2_conditioning_template_for_image_count(image_count: int) -> str:
+    """Krea2's template with one labelled vision block per image, before the prompt.
+
+    Mirrors the krea2 branch of `conditioner.hpp` in the working runtime: one
+    system turn regardless of images, then each image announced as "Picture N: "
+    ahead of its vision block, then the prompt text.
+
+    ComfyUI substitutes ONE `<|image_pad|>` per image (qwen3vl.py:192-195), so the
+    pads are not expanded to the token count here the way the C++ does.
     """
     if image_count < 0:
         raise ValueError(f"image count cannot be negative: {image_count}")
     if image_count == 0:
         return KREA2_CONDITIONING_TEMPLATE
+    labelled_vision_blocks = "".join(
+        f"Picture {index + 1}: {VISION_BLOCK}" for index in range(image_count))
     return KREA2_CONDITIONING_TEMPLATE.replace(
-        USER_TURN_OPENING, USER_TURN_OPENING + VISION_BLOCK * image_count, 1)
+        USER_TURN_OPENING, USER_TURN_OPENING + labelled_vision_blocks, 1)
 
 
 def verify_template_matches_comfyui() -> str | None:
