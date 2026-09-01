@@ -112,12 +112,13 @@ Scheduler: discrete, ported, and the default
     No tables, no per-model-version branching, no extra sample args, unlike the
     AYS and GITS schedulers beside it.
 
-    DECISION: implement it in-node and make it the first choice and default. Only
-    register it as a normally available ComfyUI scheduler if that costs nothing
-    extra beyond making it faithful in-node.
-    UNVERIFIED and the thing that decides it: whether ComfyUI's `model_sampling`
-    exposes a `t_to_sigma` equivalent that maps cleanly. If it does not, faithful
-    means more code, and the scheduler stays in-node only.
+    DECISION: implement it in-node and make it the first choice and default.
+    SETTLED, and it costs almost nothing — see the Structural Template section.
+    SIGMAS in ComfyUI is just a torch.FloatTensor, and every ModelSampling class
+    exposes `sigma(timestep)`, which is the t_to_sigma this needs. We build the
+    tensor ourselves and hand it to a sampler that takes explicit sigmas, so no
+    registration in SCHEDULER_HANDLERS is required for the node to use it.
+    Registering it globally as a named scheduler remains optional and separate.
 
 Prompt weight dial
 
@@ -355,18 +356,68 @@ Where we deliberately differ
     They take tile_width and tile_height. We take a GRID and derive the sizes per
     axis. That difference is intentional and documented above under the mechanism
 
-ARCHITECTURE: they are a MODEL PATCHER, we are a SAMPLER
+NOT OUR STRUCTURAL TEMPLATE: it is a MODEL PATCHER
     Their node patches a model and hands it on, so a normal KSampler does the
-    sampling. Ours cannot be only that, because the whole point is a node that
-    carries the Krea2 defaults, the discrete scheduler and the identity LoRA.
-    RESOLUTION, and it avoids reinventing sampling:
+    sampling. That cannot give us a full discrete scheduler, our tiling order, or
+    the Krea2 defaults carried in one node. Useful for the hook and the per-step
+    fusion evidence above; not for how the node is shaped.
+
+=== Structural Template: ComfyUI_UltimateSDUpscale ===
+
+A node that OWNS its sampling is the shape we need, and USDU is one. Read for
+NODE STRUCTURE only.
+
+DO NOT TAKE ITS TILING. The Ultimate SD Upscale paradigm is pixel tiling with
+exact cells, padding as context and mask blur. It was implemented against this
+project's own tiled diffusion, in spike_a_ultimate_sd_upscale.py, and it LOST.
+We are reading how its node is wired, not what it does to an image.
+
+LICENSE: GPL-3.0. Copyleft, not compatible with this repo being MIT. Read only.
+
+Its "No Upscale" variant validates our input decision
+    It "assumes that the input image is already upscaled ... useful if you already
+    have an upscaled image or just want to do the tiled sampling". That is exactly
+    our `upscaled reference image latent`.
+
+VERIFIED, the three ways a node can own sampling in ComfyUI
+    from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
+    from comfy_extras.nodes_custom_sampler import SamplerCustom
+    import comfy.sample
+
+    a. common_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
+                       positive, negative, latent, denoise=denoise)
+       nodes.py:1571. Widget-driven, simplest, uses ComfyUI's scheduler NAMES
+    b. SamplerCustom, taking an explicit SAMPLER object AND explicit SIGMAS
+    c. guider.sample(noise, latent_image, sampler, sigmas, denoise_mask=...,
+                     callback=..., disable_pbar=..., seed=...)
+       comfy/samplers.py:1276, with a module-level
+       comfy.samplers.sample(model, noise, positive, negative, cfg, device,
+                             sampler, sigmas, ...) at samplers.py:1349
+
+THE DISCRETE SCHEDULER QUESTION IS NOW SETTLED, and more cheaply than expected
+    We do NOT need to register a scheduler in ComfyUI's SCHEDULER_HANDLERS at all.
+    Paths (b) and (c) take SIGMAS directly, and VERIFIED that SIGMAS is nothing
+    but a torch.FloatTensor: ManualSigmas
+    (comfy_extras/nodes_custom_sampler.py:1125-1144) parses a string of numbers
+    into `torch.FloatTensor(sigmas)` and outputs it as io.Sigmas.
+    VERIFIED the t_to_sigma equivalent exists: every ModelSampling class in
+    comfy/model_sampling.py has `sigma(timestep)` — ModelSamplingDiscrete at :203,
+    ModelSamplingDiscreteFlow at :318, and so on.
+    So the port is: walk t linearly from TIMESTEPS-1 to 0 over n steps, map each
+    through model_sampling.sigma(t), build a FloatTensor. That is the upstream
+    algorithm at denoiser.hpp:32-50 with a different name for t_to_sigma.
+
+ARCHITECTURE, resolved
       1. apply the identity LoRA to the model
       2. generate vision tokens, if enabled and a model is set
       3. install the tiling via set_model_unet_function_wrapper
-      4. call `common_ksampler` (nodes.py:1571), which already takes
-         model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
-         latent, denoise
-    We write the tiling and the scheduler. ComfyUI keeps doing the sampling.
+      4. build our own discrete SIGMAS from model_sampling.sigma
+      5. sample by path (b) or (c), which accept those sigmas directly
+    We write the tiling and the sigma schedule. ComfyUI does the sampling.
+    Path (a) stays the fallback for the stock schedulers, since it is the only one
+    that takes a scheduler by NAME.
+    UNDECIDED: (b) versus (c). (c) is lower level and gives the guider directly,
+    which may matter for PAG; (b) is less code. Decide when PAG is wired.
 
 === ComfyUI Integration — REMAINING UNVERIFIED ===
 
