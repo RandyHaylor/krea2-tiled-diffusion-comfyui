@@ -18,6 +18,8 @@ The point of the split: the mechanism is known precisely, the host is not.
 
 === What This Node Is ===
 
+Node display name: **Krea2 Tiled Diffusion**
+
 One sampler node that denoises a latent as overlapping tiles fused every step,
 for Krea2, at the settings that have produced the best result so far.
 
@@ -143,14 +145,41 @@ Widgets, with the defaults below
     tile_grid, tile_overlap, rope_offsets,
     steps, cfg, sampler, scheduler, flow_shift, denoise, noise_multiplier,
     pag_enabled, pag_scale, pag_layers, pag_start, pag_end,
-    vae_tile_size
+    vae_tile_size,
+    seed + control_after_generate
+
+Seed
+    The standard KSampler arrangement: a seed widget with control_after_generate
+    beside it. VERIFIED that `common_ksampler` (nodes.py:1571) already takes
+    `seed` in exactly this shape, so this is reuse, not reimplementation.
+
+Krea2-identity-edit LoRA
+    identity_lora_name      dropdown over the loras folder
+    identity_lora_strength  FLOAT, default 1.0
+
+    FAIL SAFE: if none is selected the node still runs. It does NOT raise.
+    The node displays standing text that the LoRA is required for high quality,
+    so an unset dropdown is visibly a choice rather than a silent downgrade.
+
+    The turbo LoRA and the base model stay the user's responsibility. The
+    defaults assume a turbo setup.
+
+Vision (VLM) tokens, generated in-node
+    vision_model            model selector
+    vision_enabled          BOOLEAN, default ON
+    vision_weight           FLOAT, default 1.0
+
+    FAIL SILENTLY: with vision_enabled on but no model provided, the node
+    proceeds without vision. No error, no warning dialog.
+    This is the one place complexity is pulled IN rather than pushed out to the
+    workflow, because gathering vision tokens for the tiles is specific enough
+    to this node that making every user wire it up externally is worse.
+    The `vlm_weights` optional input stays, for a workflow that would rather
+    supply them itself. UNDECIDED: precedence when both are present.
 
 Outputs
 
     LATENT
-
-The identity LoRA loads in-node. The turbo LoRA and the base model are the
-user's responsibility; the defaults assume a turbo setup.
 
 === Two Reference Results, And What They Agree On ===
 
@@ -161,24 +190,22 @@ image with NO first stage sampled.
 They disagree on almost every axis. That disagreement is the most useful thing we
 have, because what they SHARE is what is actually carrying the result.
 
-                        REFERENCE A            REFERENCE B (newer, "shockingly
-                        (1664x2432)             good", 1248x1824)
-    grid                3x3                    2x2
-    overlap             512 (504 derived)      512
-    rope offsets        on                     on
-    steps (executed)    4                      8
-    denoise             0.1                    0.75
-    PAG                 on, scale 1, layer 7   OFF
-    hires vision input  none                   img2img_source
-    source tag weight   -                      0.5
+                        REFERENCE A     REFERENCE B     REFERENCE C (newest,
+                        (1664x2432)     (1248x1824)      "excellent", 1248x1824)
+    grid                3x3             2x2             2x2
+    overlap             512 (504 real)  512             256
+    rope offsets        on              on              on
+    steps (executed)    4               8               8
+    denoise             0.1             0.75            0.75
+    PAG                 on, s1, layer7  OFF             OFF
+    hires vision input  none            img2img_source  img2img_source
 
-    SHARED BY BOTH — treat as the load-bearing defaults
+    SHARED BY ALL THREE — treat as the load-bearing defaults
         sampler                 euler
         scheduler               discrete
         cfg                     1
         flow_shift              1.15
         noise_multiplier        1
-        tile_overlap            512
         rope_offsets            on
         vae_tile_size           32
         source sizing           1024px limit, 64px increment
@@ -187,11 +214,17 @@ have, because what they SHARE is what is actually carrying the result.
         loras  krea2_identity_edit_v1_2_r64   f794b47142
                krea2_raw_to_turbo_r256        71a50a117b
 
-Node defaults: the shared set, plus Reference B for the axes where they differ,
-since it is the newer and stronger result.
+    C is B with the overlap halved, and OBSERVED as excellent. 256 is therefore
+    sufficient at this denoise and grid, and it is much cheaper: a smaller overlap
+    means smaller derived tiles for the same grid. Overlap 512 is no longer shared
+    by all three, so it drops out of the load-bearing set and becomes a default
+    chosen on cost.
+
+Node defaults: the shared set, plus Reference C for the axes where they differ,
+since it is the newest and cheapest of the strong results.
 
     tile_grid               2x2
-    tile_overlap            512
+    tile_overlap            256
     steps                   8
     denoise                 0.75
     pag_enabled             off
@@ -253,7 +286,60 @@ Each one changes a default, so none should be guessed.
    Which of ConditioningMultiply's tensor scaling or the strength key the dial
    should drive. See the Node Interface section. Decide by testing.
 
-=== ComfyUI Integration — ALL UNVERIFIED ===
+=== Reference Implementation: shiimizu/ComfyUI-TiledDiffusion ===
+
+Read for MECHANISM, to avoid reinventing wheels. Findings below are VERIFIED by
+reading its source and by checking the API against the local ComfyUI install.
+
+LICENSE WARNING — READ BEFORE COPYING ANYTHING
+    Its README states: "The implementation of MultiDiffusion, Mixture of
+    Diffusers, and Tiled VAE code is currently under Creative Commons
+    Attribution-NonCommercial-ShareAlike 4.0 International License since it was
+    borrowed from the wonderful SD-WebUI extension. Anything else GPLv3."
+    CC BY-NC-SA 4.0 is non-commercial AND share-alike. GPLv3 is copyleft. NEITHER
+    is compatible with this repo being MIT.
+    We may read it to learn which ComfyUI APIs exist and how they behave. We may
+    NOT copy its code, or paraphrase it closely enough to be a derivative work.
+    The tiling algorithm we are porting is our own, from the krea runtime.
+
+The hook, which closes the biggest open question
+    `model.set_model_unet_function_wrapper(self.impl)`
+    VERIFIED present in this install at comfy/model_patcher.py:655.
+    That is the supported way to wrap the per-step denoise call.
+
+Their fusion is per step too, which confirms the paradigm is expressible
+    They accumulate into a buffer and divide by accumulated weights:
+        self.x_buffer[bbox.slicer] += x_tile_out[...]
+        x_out = torch.where(self.weights > 1, self.x_buffer / self.weights,
+                            self.x_buffer)
+    Same shape of idea as the raised cosine fusion we are porting. Reassuring
+    that ComfyUI does not fight this.
+
+Conditioning is sliced per tile and repeated to the tile batch size
+    Worth knowing, because our per-tile RoPE offsets have to travel the same path
+
+tile_batch_size is an idea worth stealing (the idea, not the code)
+    They batch several tiles into one model call for speed. Our design currently
+    runs tiles one at a time. CONSIDER adding, once correctness is established
+
+Where we deliberately differ
+    They take tile_width and tile_height. We take a GRID and derive the sizes per
+    axis. That difference is intentional and documented above under the mechanism
+
+ARCHITECTURE: they are a MODEL PATCHER, we are a SAMPLER
+    Their node patches a model and hands it on, so a normal KSampler does the
+    sampling. Ours cannot be only that, because the whole point is a node that
+    carries the Krea2 defaults, the discrete scheduler and the identity LoRA.
+    RESOLUTION, and it avoids reinventing sampling:
+      1. apply the identity LoRA to the model
+      2. generate vision tokens, if enabled and a model is set
+      3. install the tiling via set_model_unet_function_wrapper
+      4. call `common_ksampler` (nodes.py:1571), which already takes
+         model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
+         latent, denoise
+    We write the tiling and the scheduler. ComfyUI keeps doing the sampling.
+
+=== ComfyUI Integration — REMAINING UNVERIFIED ===
 
 Everything in this section is a reading task. I have not read ComfyUI's sampler
 internals, and anything I asserted about them would be invented.
