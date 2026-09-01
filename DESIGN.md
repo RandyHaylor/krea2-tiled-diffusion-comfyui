@@ -77,12 +77,45 @@ Judge output by CROPS, not seam metrics
 
 Inputs
 
-    latent            LATENT      required. The image to refine
-    model             MODEL       required
-    positive          CONDITIONING required. Composed elsewhere
-    negative          CONDITIONING required. Composed elsewhere
-    vlm_weights       (optional)  gathered by other nodes, passed through
-    identity_lora     (in-node)   see below
+    upscaled reference image latent   LATENT   required
+    model                             MODEL    required
+    positive                          CONDITIONING required. Composed elsewhere
+    negative                          CONDITIONING required. Composed elsewhere
+    vlm_weights                       optional. Gathered by other nodes
+    identity_lora                     in-node. See below
+
+The node does NO resizing
+    It expects a latent that is ALREADY at the target resolution, which is what
+    the input name says. There are plenty of ways to upscale an image or a latent
+    in ComfyUI and no reason to add another.
+    This is a deliberate narrowing against the runtime it came from, where the
+    hires pass upscaled the latent itself (104x152 -> 156x228). Here that is the
+    workflow's job.
+
+Scheduler: discrete, ported, and the default
+
+    CORRECTION to an earlier assumption in this project: the discrete scheduler is
+    NOT a custom addition of ours. VERIFIED - the vendor patch contains zero
+    occurrences of the string "discrete"; `DISCRETE_SCHEDULER` is upstream
+    stable-diffusion.cpp, at include/stable-diffusion.h:66 and
+    src/stable-diffusion.cpp:3641.
+
+    It still has to be ported, for a different reason: VERIFIED that ComfyUI has
+    no discrete scheduler. Its full set at comfy/samplers.py:1365 is simple,
+    sgm_uniform, karras, exponential, ddim_uniform, beta, normal,
+    linear_quadratic, kl_optimal.
+
+    VERIFIED the port is small. src/runtime/denoiser.hpp:32-50 walks t linearly
+    from TIMESTEPS - 1 down to 0 across n steps and maps each through t_to_sigma.
+    No tables, no per-model-version branching, no extra sample args, unlike the
+    AYS and GITS schedulers beside it.
+
+    DECISION: implement it in-node and make it the first choice and default. Only
+    register it as a normally available ComfyUI scheduler if that costs nothing
+    extra beyond making it faithful in-node.
+    UNVERIFIED and the thing that decides it: whether ComfyUI's `model_sampling`
+    exposes a `t_to_sigma` equivalent that maps cleanly. If it does not, faithful
+    means more code, and the scheduler stays in-node only.
 
 Prompt weight dial
 
