@@ -77,6 +77,13 @@ def apply_identity_lora(model, lora_name: str, strength: float):
 
 
 def available_lora_names() -> list[str]:
+    """The LoRA dropdown's options, read fresh each time the schema is built.
+
+    Called while building the schema rather than handed over as a callable:
+    define_schema runs per /object_info request, so the list stays current, and
+    anything left unserialisable in a schema takes that whole endpoint down.
+    ComfyUI's own LoraLoaderModelOnly calls it the same way (nodes.py:760).
+    """
     return [NO_LORA_SELECTED] + folder_paths.get_filename_list("loras")
 
 
@@ -137,7 +144,7 @@ class Krea2TiledDiffusion(io.ComfyNode):
                                  tooltip="Give each tile position ids at its true "
                                          "place on the canvas instead of letting "
                                          "every tile claim the origin."),
-                io.Combo.Input("identity_lora_name", options=available_lora_names,
+                io.Combo.Input("identity_lora_name", options=available_lora_names(),
                                tooltip="Krea2-identity-edit LoRA. REQUIRED for high "
                                        "quality; sampling proceeds without it."),
                 io.Float.Input("identity_lora_strength", default=1.0, min=-10.0,
