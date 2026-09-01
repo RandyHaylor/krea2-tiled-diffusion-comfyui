@@ -417,41 +417,296 @@ ARCHITECTURE, resolved
     (b) is less code. With PAG out of scope there is no known reason to need the
     guider, so start with (b) and drop to (c) only if something demands it.
 
-=== ComfyUI Integration — REMAINING UNVERIFIED ===
+=== ComfyUI Integration — ANSWERED BY READING SOURCE ===
 
-Everything in this section is a reading task. I have not read ComfyUI's sampler
-internals, and anything I asserted about them would be invented.
+Every item here was an open reading task. All are now closed except vision, which
+turned out to be a design blocker rather than a fact to look up.
 
-Known from a directory listing only
+a. THE PER-STEP HOOK. CLOSED
+   `model.set_model_unet_function_wrapper(fn)` -> model_patcher.py:655, which just
+   stores model_options["model_function_wrapper"].
+   It is invoked at comfy/samplers.py:333 as
+       output = model_options['model_function_wrapper'](
+           model.apply_model,
+           {"input": input_x, "timestep": timestep_, "c": c,
+            "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
+   So the wrapper receives (apply_model, kwargs) and returns a tensor shaped like
+   `input`. That is precisely the one-step interception the fusion needs.
+   NOTE it is called per cond batch, and `cond_or_uncond` says which. The tiling
+   must be correct for a batched input, not assume batch 1.
 
-    comfy/samplers.py, comfy/sample.py, comfy/model_patcher.py,
-    comfy/patcher_extension.py, comfy/extra_samplers/  exist
-    comfy/ldm/krea2/model.py exists, and krea2 appears in supported_models.py,
-    model_detection.py, model_base.py, sd.py and lora.py
-        -> Krea2 is natively supported. This is a TILING node, not a model port
+b. ROPE OFFSETS PER TILE. CLOSED, and reachable
+   Krea2 builds position ids in `process_img` (ldm/krea2/model.py:289-293):
+       img_ids[..., 1] = torch.arange(h)[:, None]
+       img_ids[..., 2] = torch.arange(w)[None, :]
+   From torch.arange, so a tile passed alone is labelled from the ORIGIN. That is
+   exactly the "every tile claims the origin" behaviour, and it is the default.
+   The offset is applied through a patch point at :346-351:
+       patches = transformer_options.get("patches", {})
+       if "post_input" in patches:
+           for p in patches["post_input"]:
+               out = p({"img":..., "txt":..., "img_ids": imgpos,
+                        "txt_ids": txtpos, "transformer_options":...})
+               imgpos, txtpos = out["img_ids"], out["txt_ids"]
+   Registered with `set_model_patch(patch, "post_input")` (model_patcher.py:661).
+   So: add the tile's (row, col) latent origin to imgpos[..., 1] and [..., 2].
 
-Must be answered by reading source, before any design is fixed
+c. DENOISE AND THE STEP COUNT. CLOSED — and it is the INVERSE of the krea runtime
+   comfy/samplers.py:1431-1441
+       new_steps = int(steps/denoise)
+       sigmas = self.calculate_sigmas(new_steps)
+       self.sigmas = sigmas[-(steps + 1):]
+   BasicScheduler (nodes_custom_sampler.py:17-42) does the same for the SIGMAS
+   path. ComfyUI builds a LONGER schedule and keeps the tail, so `steps` already
+   means steps EXECUTED.
+   The krea runtime did the opposite: t_enc = int(sample_steps * strength)
+   truncated, and the app pre-scaled with scheduled_steps_for_executed_steps.
+   DO NOT PORT THAT SCALING. Porting it would double-scale and quietly run the
+   wrong number of steps, which is the same class of error it was written to fix.
+   Our own discrete sigma builder MUST replicate ComfyUI's convention:
+   build int(steps/denoise) sigmas, then keep the last steps+1.
 
-    a. What hook lets a node wrap the per-step denoise call? The mechanism needs
-       to intercept one step, run the model N times on N tile views, fuse, and
-       return one result. `patcher_extension.py` and `model_patcher.py` are the
-       first places to look
-    b. How are position ids / RoPE supplied to the Krea2 model, and can they be
-       offset per call? RoPE offsets are a default here, so if this is not
-       reachable the default is not deliverable
-    c. How does a node express "sample only the tail of the schedule" for a low
-       denoise? The executed-steps-vs-scheduled-steps distinction bit this
-       project hard: 8 steps at denoise 0.4 spent THREE evaluations, and every
-       measurement taken before that was understood was mislabelled. Find out
-       what ComfyUI's denoise actually does before trusting a step count
-    d. Does the installed `comfyui-anima-asampler`
-       already implement any of this? Read what they DO, not what they claim
-    e. Is there an existing tiled-diffusion node in the wild worth reading? Read
-       for mechanism only: specifically whether it fuses per step or per tile
+d. PROMPT WEIGHT MECHANISM. CLOSED
+   Use the ConditioningMultiply approach: scale the embedding tensor and the
+   pooled_output (nodes.py:174-183).
+   NOT the `strength` key. VERIFIED that `strength` is consumed inside
+   get_area_and_mult (samplers.py:52-53), where it scales the AREA blending mask
+   that composes multiple conditionings. It is a region weight, not prompt
+   emphasis. The two are unrelated operations and the earlier "pick by testing"
+   framing was comparing the wrong things.
+
+e. TOOLTIPS. CLOSED, fully supported
+   Per-input `tooltip=` (typed in comfy_types/node_typing.py:118, used throughout
+   nodes.py and nodes_custom_sampler.py) and node-level `DESCRIPTION`, which the
+   UI shows on hover. The low denoise recipe can live on the denoise tooltip.
+
+f. FLOW SHIFT. CLOSED, and the widget is probably unnecessary
+   Krea2's sampling_settings in supported_models.py:1933-1936 are already
+   {"multiplier": 1.0, "shift": 1.15}. Shift 1.15 is the model's own default and
+   matches every reference generation. A widget would only be needed to override
+   it, which no reference does.
+
+g. VISION / vlm_weights. NOT A LOOKUP — A DESIGN BLOCKER. See its own section.
 
 Rule for this section, from the user: do not copy other code without verifying
 the mechanism it uses. A node that looks like tiled diffusion but fuses finished
 tiles is the failure mode this whole design exists to avoid.
+
+=== BLOCKER: in-node vision generation is not implementable as specified ===
+
+VERIFIED: Krea2's text encoder is qwen3vl_4b, a vision-language model
+(supported_models.py:1953). Vision images enter through the TOKENIZER:
+    Krea2Tokenizer.tokenize_with_weights(self, text, ..., images=[], ...)
+        comfy/text_encoders/krea2.py:28
+and the node-level pattern is clip.tokenize(prompt, images=images), as
+TextEncodeQwenImageEdit does at comfy_extras/nodes_qwen.py:46.
+
+CONSEQUENCE: vision tokens are produced when the PROMPT IS ENCODED, and arrive
+already baked into CONDITIONING. By the time this node receives CONDITIONING the
+vision is either in it or not. There is nothing for a `vision_model` widget or a
+`vlm_weights` socket to do at sampling time.
+
+The requested design — a vision model selector, a toggle and a weight inside this
+node — cannot be built without the node also taking CLIP and the raw prompt TEXT
+and doing its own encoding. That directly reverses the decision that this node
+takes composed pos/neg conditioning and leaves text to the workflow.
+
+OPTIONS, for the user to choose. NOT decided here.
+  1. Drop in-node vision. Document that a Krea2 text-encode node upstream takes
+     images, and that the img2img source should be given to it. Keeps the node's
+     contract clean. Loses the convenience that motivated the request.
+  2. Add optional CLIP + IMAGE + prompt-text inputs and encode inside the node
+     when they are supplied, falling back to the passed-in CONDITIONING when they
+     are not. Delivers the convenience, at the cost of the node knowing about
+     text encoding after all.
+  3. A separate companion node in this repo that wraps clip.tokenize(images=...)
+     with the vision weight, outputting CONDITIONING. Keeps this node clean and
+     still saves the user from assembling it by hand.
+
+Until this is decided, the vision widgets and the vlm_weights socket are NOT part
+of the interface, and the flow below is written without them.
+
+=== Fully Informed Flow (pseudocode, no code yet) ===
+
+Every ComfyUI call named here was read in the local install. Line references are
+to that install. Vision is absent because it is blocked above.
+
+--- entry point -------------------------------------------------------------
+
+execute(upscaled_reference_image_latent, model, positive, negative,
+        seed, steps, cfg, sampler_name, scheduler, denoise,
+        tile_grid, tile_overlap_pixels, rope_offsets_enabled,
+        identity_lora_name, identity_lora_strength,
+        positive_prompt_weight, negative_prompt_weight):
+
+    model_for_this_run = apply_identity_lora(model, identity_lora_name,
+                                             identity_lora_strength)
+
+    positive = scale_conditioning(positive, positive_prompt_weight)
+    negative = scale_conditioning(negative, negative_prompt_weight)
+
+    latent_height, latent_width = shape_of(upscaled_reference_image_latent)
+
+    tile_plan = plan_tiles(latent_width, latent_height,
+                           tile_grid, tile_overlap_pixels)
+
+    model_for_this_run = install_tiled_denoise(model_for_this_run, tile_plan,
+                                               rope_offsets_enabled)
+
+    sigmas = build_sigmas(model_for_this_run, scheduler, steps, denoise)
+
+    return sample_with(model_for_this_run, positive, negative, cfg, seed,
+                       sampler_name, sigmas, upscaled_reference_image_latent)
+
+--- identity lora -----------------------------------------------------------
+
+apply_identity_lora(model, name, strength):
+    if name is empty or "none":
+        return model            # FAIL SAFE. never raise. node text says why
+    return comfy.sd.load_lora_for_models(model, clip=None, lora, strength, 0)[0]
+    # UNVERIFIED detail: exact loader call. LoraLoaderModelOnly in nodes.py:764
+    # is the pattern to copy the shape of
+
+--- prompt weight -----------------------------------------------------------
+
+scale_conditioning(conditioning, multiplier):
+    if multiplier == 1.0:
+        return conditioning     # leave the tensor untouched at neutral
+    for each (embedding, meta) in conditioning:
+        scaled_embedding = embedding * multiplier
+        if meta has pooled_output:
+            meta.pooled_output = meta.pooled_output * multiplier
+    # mirrors ConditioningMultiply, nodes.py:174-183
+    # NOT the "strength" key, which is an area blend weight (samplers.py:52)
+
+--- tile planning, ported from the krea runtime, pure and unit testable ------
+
+plan_tiles(width, height, grid, overlap_pixels):
+    columns, rows = parse_grid(grid)              # "2x2" -> 2, 2
+    overlap = overlap_pixels / 8                  # LATENT_SCALE
+    tile_w = tile_size_covering_length(width,  columns, overlap)
+    tile_h = tile_size_covering_length(height, rows,    overlap)
+    xs = tile_start_positions_covering_length(width,  tile_w, overlap)
+    ys = tile_start_positions_covering_length(height, tile_h, overlap)
+    return [ (x, y, tile_w, tile_h) for y in ys for x in xs ]
+
+tile_size_covering_length(length, count, overlap):
+    overlap = clamp(overlap, 0, length // count)  # a big request comes back small
+    exact = (length + overlap * (count - 1)) / count
+    return round_up_to_whole_latent_cell(min(length, exact))
+
+tile_start_positions_covering_length(length, tile, overlap):
+    if length <= tile: return [0]
+    stride = max(1, tile - overlap)
+    count  = ceil((length - tile) / stride) + 1
+    # SPREAD evenly, do not march at the stride
+    return [ (i * (length - tile)) // (count - 1) for i in range(count) ]
+
+--- the tiling itself, the reason this node exists --------------------------
+
+install_tiled_denoise(model, tile_plan, rope_offsets_enabled):
+    model = model.clone()
+
+    def tiled_denoise(apply_model, arguments):
+        x         = arguments["input"]        # (batch, ch, H, W)
+        timestep  = arguments["timestep"]
+        c         = arguments["c"]
+
+        if len(tile_plan) == 1:
+            return apply_model(x, timestep, **c)   # nothing to fuse
+
+        accumulated = zeros_like(x)
+        weights     = zeros_like(x)
+
+        for (x0, y0, tw, th) in tile_plan:
+            tile_x = x[:, :, y0:y0+th, x0:x0+tw]
+            tile_c = slice_conditioning_spatially(c, x0, y0, tw, th)
+
+            if rope_offsets_enabled:
+                set_rope_origin_for_this_tile(x0, y0)   # see below
+
+            tile_out = apply_model(tile_x, timestep, **tile_c)
+
+            window = raised_cosine_window(th, tw)
+            accumulated[:, :, y0:y0+th, x0:x0+tw] += tile_out * window
+            weights    [:, :, y0:y0+th, x0:x0+tw] += window
+
+        return accumulated / clamp_min(weights, epsilon)
+
+    model.set_model_unet_function_wrapper(tiled_denoise)
+    if rope_offsets_enabled:
+        model.set_model_patch(rope_offset_patch, "post_input")
+    return model
+
+    # the wrapper contract is samplers.py:333. It is called PER COND BATCH and
+    # `cond_or_uncond` says which, so this must be correct for batch > 1
+
+--- rope offsets, per tile --------------------------------------------------
+
+rope_offset_patch(fields):
+    # registered as "post_input"; krea2/model.py:346-351 hands us img_ids and
+    # takes back whatever we return
+    img_ids = fields["img_ids"]        # (1, h*w, 3); [...,1]=row, [...,2]=col
+    row0, col0 = current_tile_origin_in_latent_cells()
+    img_ids[..., 1] += row0
+    img_ids[..., 2] += col0
+    fields["img_ids"] = img_ids
+    return fields
+
+    # WITHOUT this, process_img builds ids from torch.arange (model.py:291-292),
+    # so every tile claims the origin. That is the "off" behaviour, and it is
+    # what the earlier 2x2 measurement preferred. Default here is ON
+
+    # OPEN IMPLEMENTATION DETAIL, not a design question: the patch has to know
+    # WHICH tile is currently being denoised. The loop above sets it before
+    # calling apply_model. Needs to be safe if ComfyUI ever runs tiles
+    # concurrently; today the loop is sequential
+
+--- sigmas: the discrete scheduler, ported ----------------------------------
+
+build_sigmas(model, scheduler, steps, denoise):
+    if scheduler != "discrete":
+        return comfy.samplers.calculate_sigmas(model_sampling, scheduler, ...)
+        # stock path, ComfyUI's nine named schedulers
+
+    # MUST match ComfyUI's convention, which is the INVERSE of the krea runtime
+    if denoise <= 0: return empty tensor
+    total_steps = steps if denoise >= 1.0 else int(steps / denoise)
+
+    model_sampling = model.get_model_object("model_sampling")
+    t_max = TIMESTEPS - 1
+    step  = t_max / (total_steps - 1)
+    sigmas = [ model_sampling.sigma(t_max - step * i)
+               for i in range(total_steps) ]
+    sigmas.append(0.0)
+    return FloatTensor(sigmas)[-(steps + 1):]
+
+    # algorithm: denoiser.hpp:32-50. t_to_sigma is model_sampling.sigma
+    #            (model_sampling.py:203 / :318)
+    # tail slicing: samplers.py:1441 and BasicScheduler
+    # DO NOT also apply scheduled_steps_for_executed_steps. ComfyUI already
+    # scales. Doing both would run the wrong number of steps
+
+--- sampling ----------------------------------------------------------------
+
+sample_with(model, positive, negative, cfg, seed, sampler_name, sigmas, latent):
+    noise   = comfy.sample.prepare_noise(latent["samples"], seed)
+    sampler = comfy.samplers.sampler_object(sampler_name)   # samplers.py:1388
+    samples = comfy.samplers.sample(model, noise, positive, negative, cfg,
+                                    device, sampler, sigmas,
+                                    latent_image=latent["samples"], seed=seed)
+    return { **latent, "samples": samples }
+
+    # samplers.py:1349. Takes explicit sigmas, which is why no scheduler has to
+    # be registered with ComfyUI at all
+
+--- what is deliberately absent ---------------------------------------------
+
+    no resizing            the input latent is already at target
+    no PAG                 never reached the hires pass; ComfyUI has its own
+    no flow_shift widget   Krea2 already ships shift 1.15
+    no vision              blocked, see above
+    no noise_multiplier    every reference uses 1. ADD ONLY IF ASKED
 
 === Testing ===
 
