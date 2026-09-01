@@ -10,6 +10,7 @@ import logging
 
 import comfy.samplers
 import comfy.sample
+import comfy.sd
 import comfy.utils
 import folder_paths
 import latent_preview
@@ -72,7 +73,6 @@ def apply_identity_lora(model, lora_name: str, strength: float):
                         "sampling without it", lora_name)
         return model
     lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-    import comfy.sd
     return comfy.sd.load_lora_for_models(model, None, lora, strength, 0)[0]
 
 
