@@ -18,6 +18,11 @@ from krea2_prompt_template import (
     verify_template_matches_comfyui,
     vision_pixel_budget_for_size,
 )
+from krea2_vision_token_weighting import (
+    count_vision_tokens_for_image_size,
+    locate_vision_token_spans,
+    scale_vision_tokens_in_conditioning,
+)
 
 
 def resize_image_to_vision_pixel_budget(image, pixel_budget: int):
@@ -28,6 +33,36 @@ def resize_image_to_vision_pixel_budget(image, pixel_budget: int):
     height = max(1, round(samples.shape[2] * scale))
     resized = comfy.utils.common_upscale(samples, width, height, "area", "disabled")
     return resized.movedim(1, -1)[:, :, :, :3]
+
+
+def weight_the_vision_tokens(conditioning, tokens, images, weight: float):
+    """Scale the vision tokens' rows, warning rather than raising if unlocatable."""
+    token_row = tokens[next(iter(tokens))][0]
+    image_slot_indices = [index for index, entry in enumerate(token_row)
+                          if isinstance(entry[0], dict)]
+    vision_token_counts = [count_vision_tokens_for_image_size(
+        int(single_image.shape[1]), int(single_image.shape[2])) for single_image in images]
+
+    if len(image_slot_indices) != len(vision_token_counts):
+        logging.warning("Krea2-Qwen3 Image and Text Encoder: found %d image slot(s) for "
+                        "%d image(s); leaving the vision weight unapplied",
+                        len(image_slot_indices), len(vision_token_counts))
+        return conditioning
+
+    spans = locate_vision_token_spans(
+        image_slot_indices=image_slot_indices,
+        token_row_length=len(token_row),
+        vision_token_counts=vision_token_counts,
+        encoded_length=int(conditioning[0][0].shape[1]))
+    weighted = scale_vision_tokens_in_conditioning(conditioning, spans, weight)
+    if weighted is conditioning:
+        logging.warning("Krea2-Qwen3 Image and Text Encoder: vision token spans %s do "
+                        "not fit the %d token conditioning; weight not applied",
+                        spans, int(conditioning[0][0].shape[1]))
+    else:
+        logging.info("Krea2-Qwen3 Image and Text Encoder: vision weight %.3g on %s",
+                     weight, spans)
+    return weighted
 
 
 class Krea2Qwen3ImageAndTextEncoder(io.ComfyNode):
@@ -57,6 +92,12 @@ class Krea2Qwen3ImageAndTextEncoder(io.ComfyNode):
                     tooltip="Each image is resized to about this many pixels square "
                             "before the vision tower reads it. 512 is what the "
                             "reference generations used."),
+                io.Float.Input(
+                    "vision_weight", default=1.0, min=0.0, max=10.0, step=0.05,
+                    tooltip="How hard the vision tokens pull against the text. "
+                            "Above 1 anchors a tiled generation to the whole "
+                            "image, which lets a smaller tile overlap hold "
+                            "together. Exactly 1 leaves the conditioning alone."),
             ],
             outputs=[
                 io.Conditioning.Output(
@@ -66,7 +107,8 @@ class Krea2Qwen3ImageAndTextEncoder(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, prompt, image=None,
-                vision_size=DEFAULT_VISION_SIZE) -> io.NodeOutput:
+                vision_size=DEFAULT_VISION_SIZE,
+                vision_weight=1.0) -> io.NodeOutput:
         stale_template_warning = verify_template_matches_comfyui()
         if stale_template_warning is not None:
             logging.warning("Krea2-Qwen3 Image and Text Encoder: %s", stale_template_warning)
@@ -88,4 +130,9 @@ class Krea2Qwen3ImageAndTextEncoder(io.ComfyNode):
             llama_template=build_krea2_conditioning_template_for_image_count(
                 len(images_for_vision_tower)),
         )
-        return io.NodeOutput(clip.encode_from_tokens_scheduled(tokens))
+        conditioning = clip.encode_from_tokens_scheduled(tokens)
+
+        if images_for_vision_tower and vision_weight != 1.0:
+            conditioning = weight_the_vision_tokens(
+                conditioning, tokens, images_for_vision_tower, vision_weight)
+        return io.NodeOutput(conditioning)
