@@ -145,7 +145,6 @@ Widgets, with the defaults below
 
     tile_grid, tile_overlap, rope_offsets,
     steps, cfg, sampler, scheduler, flow_shift, denoise, noise_multiplier,
-    pag_enabled, pag_scale, pag_layers, pag_start, pag_end,
     vae_tile_size,
     seed + control_after_generate
 
@@ -198,7 +197,6 @@ have, because what they SHARE is what is actually carrying the result.
     rope offsets        on              on              on              on
     steps (executed)    4               8               8               4
     denoise             0.1             0.75            0.75            0.1
-    PAG                 on, s1, layer7  OFF             OFF             on, s1, layer7
     hires vision input  none            img2img_source  img2img_source  img2img_source
 
     D is A with the vision actually reaching the hires pass, and with a turbo
@@ -232,7 +230,6 @@ since it is the newest and cheapest of the strong results.
     tile_overlap            256
     steps                   8
     denoise                 0.75
-    pag_enabled             off
 
 Why 2x2 is the default even though 3x3 improves quality
     OBSERVED: 3x3 DOES improve quality. It is not doing nothing and it is not
@@ -254,7 +251,6 @@ TWO RECIPES, not two points on a scale
         overlap         256
         steps           8
         denoise         0.75
-        PAG             off
         vision          on
 
     LOW DENOISE — "slightly enhance what is already there"   [Reference D]
@@ -262,7 +258,6 @@ TWO RECIPES, not two points on a scale
         overlap         512
         steps           4
         denoise         0.1
-        PAG             on, scale 1, layers 7, window 0-1
         vision          on
         More tiles and wider overlap earn their cost here, where the pass is not
         allowed to redraw much and coverage is doing the work.
@@ -306,11 +301,13 @@ Each one changes a default, so none should be guessed.
    as good as B without vision, vision is optional; if B is better because of it,
    it is not. Confirm on hardware.
 
-3. PAG: on in A, OFF in B, at cfg 1 in both
-   B being the stronger result with PAG off suggests PAG is not what was carrying
-   it. Default off, per B. Note ComfyUI's PAG is a separate node here
-   (`comfyui-anima-safe-pag` installed) and may not compose the same way, so
-   defaulting it off also removes an integration unknown.
+3. PAG is OUT OF SCOPE, and was never in play
+   VERIFIED: the hires call site passes a default-constructed sd_pag_params_t{}
+   (stable-diffusion.cpp:6325), while the main pass passes the real
+   sample_params.pag (:6135). PAG never reached the hires pass.
+   So the "PAG: on" in references A and D is doubly inert - the hires pass got an
+   empty struct, and their first stage sampled zero steps anyway. The node has no
+   PAG widgets. ComfyUI has PAG nodes of its own for anyone who wants it.
 
 4. PROMPT WEIGHT MECHANISM
    Which of ConditioningMultiply's tensor scaling or the strength key the dial
@@ -416,8 +413,9 @@ ARCHITECTURE, resolved
     We write the tiling and the sigma schedule. ComfyUI does the sampling.
     Path (a) stays the fallback for the stock schedulers, since it is the only one
     that takes a scheduler by NAME.
-    UNDECIDED: (b) versus (c). (c) is lower level and gives the guider directly,
-    which may matter for PAG; (b) is less code. Decide when PAG is wired.
+    UNDECIDED: (b) versus (c). (c) is lower level and hands back the guider;
+    (b) is less code. With PAG out of scope there is no known reason to need the
+    guider, so start with (b) and drop to (c) only if something demands it.
 
 === ComfyUI Integration — REMAINING UNVERIFIED ===
 
@@ -446,7 +444,7 @@ Must be answered by reading source, before any design is fixed
        project hard: 8 steps at denoise 0.4 spent THREE evaluations, and every
        measurement taken before that was understood was mislabelled. Find out
        what ComfyUI's denoise actually does before trusting a step count
-    d. Does the installed `comfyui-anima-asampler` or `comfyui-anima-safe-pag`
+    d. Does the installed `comfyui-anima-asampler`
        already implement any of this? Read what they DO, not what they claim
     e. Is there an existing tiled-diffusion node in the wild worth reading? Read
        for mechanism only: specifically whether it fuses per step or per tile

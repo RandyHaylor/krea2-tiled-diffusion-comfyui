@@ -33,7 +33,6 @@ middle ground between them is worse than either end.
 | overlap        | 256px                     | 512px           |
 | steps          | 8                         | 4               |
 | denoise        | 0.75                      | 0.10            |
-| PAG            | off                       | on, scale 1, layers 7, window 0–1 |
 | vision         | on                        | on              |
 
 Shared by both: **euler** + **discrete**, cfg **1**, flow shift **1.15**, noise
