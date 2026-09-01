@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Checks for the per-step tile fusion and the per-tile RoPE offset.
+
+apply_model is stubbed, so these run without a model or a GPU, but the tensor
+arithmetic is real. Run with ComfyUI's interpreter:
+    ComfyUI/.venv/bin/python tests/test_krea2_tiled_denoise.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from krea2_rope_tile_offset import (  # noqa: E402
+    KREA2_PATCH_SIZE,
+    TileRopeOffsetHolder,
+    build_post_input_rope_offset_patch,
+)
+from krea2_tile_planning import plan_latent_tiles  # noqa: E402
+from krea2_tiled_denoise import (  # noqa: E402
+    build_tile_fusion_weight,
+    denoise_latent_as_fused_tiles,
+)
+
+failures: list[str] = []
+
+
+def check(description: str, passed: bool, detail: str = "") -> None:
+    print(f"{'PASS' if passed else 'FAIL'}: {description}{(' ' + detail) if detail else ''}")
+    if not passed:
+        failures.append(description)
+
+
+def main() -> int:
+    plan = plan_latent_tiles(latent_width=156, latent_height=228,
+                             tile_grid="3x3", tile_overlap_pixels=512)
+    latent = torch.randn(2, 16, 228, 156)
+
+    # A model that returns its input unchanged. Whatever the weights are, a
+    # correctly normalised fusion of identical predictions must rebuild the input.
+    # This is what proves the raised cosine and the weight division agree.
+    returns_input_unchanged = lambda tile, timestep, **conditioning: tile
+    fused = denoise_latent_as_fused_tiles(
+        returns_input_unchanged, latent, timestep=None, conditioning={},
+        plan=plan, rope_offset_holder=None)
+    check("fusing an identity model reconstructs the latent exactly",
+          torch.allclose(fused, latent, atol=1e-5),
+          f"max deviation {float((fused - latent).abs().max()):.3e}")
+    check("the fused result keeps the input shape and dtype",
+          fused.shape == latent.shape and fused.dtype == latent.dtype,
+          f"got {tuple(fused.shape)} {fused.dtype}")
+
+    # A model returning a constant must also come back as that constant, which
+    # catches a weight accumulator that is off anywhere on the canvas.
+    returns_constant = lambda tile, timestep, **conditioning: torch.full_like(tile, 3.5)
+    constant_fused = denoise_latent_as_fused_tiles(
+        returns_constant, latent, timestep=None, conditioning={},
+        plan=plan, rope_offset_holder=None)
+    check("a constant prediction fuses to that constant across the whole canvas",
+          torch.allclose(constant_fused, torch.full_like(latent, 3.5), atol=1e-5),
+          f"range {float(constant_fused.min()):.4f}..{float(constant_fused.max()):.4f}")
+
+    tiles_seen = []
+    record_tile_shapes = lambda tile, timestep, **conditioning: (
+        tiles_seen.append(tuple(tile.shape)) or tile)
+    denoise_latent_as_fused_tiles(record_tile_shapes, latent, timestep=None,
+                                 conditioning={}, plan=plan, rope_offset_holder=None)
+    check("the model is called once per planned tile",
+          len(tiles_seen) == len(plan.tiles), f"got {len(tiles_seen)} calls")
+    check("every tile keeps the full batch and channel count",
+          all(shape[0] == 2 and shape[1] == 16 for shape in tiles_seen),
+          f"got {set((s[0], s[1]) for s in tiles_seen)}")
+
+    single_tile_plan = plan_latent_tiles(latent_width=64, latent_height=64,
+                                         tile_grid="1x1", tile_overlap_pixels=128)
+    single_calls = []
+    count_calls = lambda tile, timestep, **conditioning: (
+        single_calls.append(tuple(tile.shape)) or tile)
+    small_latent = torch.randn(1, 16, 64, 64)
+    denoise_latent_as_fused_tiles(count_calls, small_latent, timestep=None,
+                                 conditioning={}, plan=single_tile_plan,
+                                 rope_offset_holder=None)
+    check("a single tile skips the fusion and calls the model once, whole",
+          single_calls == [(1, 16, 64, 64)], f"got {single_calls}")
+
+    weight = build_tile_fusion_weight(8, 6, torch.device("cpu"), torch.float32)
+    check("the fusion weight is shaped for broadcasting over batch and channels",
+          tuple(weight.shape) == (1, 1, 8, 6), f"got {tuple(weight.shape)}")
+    check("the fusion weight is strictly positive everywhere",
+          bool((weight > 0).all()), f"min {float(weight.min()):.6f}")
+    check("the fusion weight is largest at the tile centre",
+          float(weight[0, 0, 4, 3]) > float(weight[0, 0, 0, 0]))
+
+    # stable-diffusion.cpp:3126 divides the latent start by the patch size of 2.
+    holder = TileRopeOffsetHolder()
+    holder.set_to_tile_origin(row_start=54, column_start=23)
+    check("the rope offset is the latent origin in token units",
+          (holder.row_offset_tokens, holder.column_offset_tokens)
+          == (54 // KREA2_PATCH_SIZE, 23 // KREA2_PATCH_SIZE),
+          f"got {holder.row_offset_tokens}, {holder.column_offset_tokens}")
+    holder.clear()
+    check("clearing the holder returns both offsets to zero",
+          (holder.row_offset_tokens, holder.column_offset_tokens) == (0, 0))
+
+    patch = build_post_input_rope_offset_patch(holder)
+    original_ids = torch.zeros(1, 4, 3)
+    original_ids[..., 1] = torch.tensor([0.0, 0.0, 1.0, 1.0])
+    original_ids[..., 2] = torch.tensor([0.0, 1.0, 0.0, 1.0])
+
+    unchanged = patch({"img_ids": original_ids.clone()})["img_ids"]
+    check("a cleared holder leaves position ids untouched",
+          torch.equal(unchanged, original_ids))
+
+    holder.set_to_tile_origin(row_start=54, column_start=22)
+    shifted = patch({"img_ids": original_ids.clone()})["img_ids"]
+    check("the patch shifts rows by the tile's token row offset",
+          torch.allclose(shifted[..., 1], original_ids[..., 1] + 27),
+          f"got {shifted[..., 1].tolist()}")
+    check("the patch shifts columns by the tile's token column offset",
+          torch.allclose(shifted[..., 2], original_ids[..., 2] + 11),
+          f"got {shifted[..., 2].tolist()}")
+    check("the patch leaves the first position id axis alone",
+          torch.allclose(shifted[..., 0], original_ids[..., 0]))
+
+    # The loop must clear the offset even if the model raises, or the next
+    # generation would silently start from a stale tile position.
+    holder.clear()
+    def raises_after_being_given_an_offset(tile, timestep, **conditioning):
+        raise RuntimeError("model failed mid-tile")
+    try:
+        denoise_latent_as_fused_tiles(raises_after_being_given_an_offset, latent,
+                                     timestep=None, conditioning={}, plan=plan,
+                                     rope_offset_holder=holder)
+    except RuntimeError:
+        pass
+    check("a failing model still leaves the rope offset cleared",
+          (holder.row_offset_tokens, holder.column_offset_tokens) == (0, 0),
+          f"got {holder.row_offset_tokens}, {holder.column_offset_tokens}")
+
+    if failures:
+        print(f"\n{len(failures)} failing checks:")
+        for failed in failures:
+            print(f"  - {failed}")
+        return 1
+    print("\nall krea2 tiled denoise checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

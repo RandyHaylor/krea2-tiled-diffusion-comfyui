@@ -11,12 +11,14 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
 from krea2_image_and_text_encoder_node import Krea2Qwen3ImageAndTextEncoder
+from krea2_tiled_diffusion_node import Krea2TiledDiffusion
 
 
 class Krea2TiledDiffusionExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            Krea2TiledDiffusion,
             Krea2Qwen3ImageAndTextEncoder,
         ]
 
