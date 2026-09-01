@@ -163,14 +163,15 @@ since it is the newer and stronger result.
     denoise                 0.75
     pag_enabled             off
 
-Why 2x2 and not 3x3, given 3x3 looked better earlier
-    OBSERVED: the higher denoise solved the imbalance that made more tile overlap
-    necessary. 3x3 was compensating for a problem that a denoise of 0.75 does not
-    have. So the extra coverage is no longer buying anything, and 2x2 is 4 model
-    evaluations per step instead of 9.
-    This supersedes the earlier reasoning that more overlapping tiles give a
-    better "centred opinion" of each region. That was a theory about coverage;
-    the denoise turned out to be the variable that mattered.
+Why 2x2 is the default even though 3x3 improves quality
+    OBSERVED: 3x3 DOES improve quality. It is not doing nothing and it is not
+    merely compensating for a defect.
+    OBSERVED, and separate from the grid: Krea 2 appears to shine at img2img
+    around 0.75 denoise. The user has seen this across other work, not only here.
+    Cause unknown, possibly training, possibly coincidence. NOT investigated.
+    2x2 is the default because 0.75 denoise reaches a strong result at 4 model
+    evaluations per step instead of 9. That is a cost choice, not a claim that
+    3x3 is worthless. Raise the grid when the quality is worth the time.
 
 The two references are two different jobs, not two points on a scale
 

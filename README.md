@@ -36,4 +36,4 @@ Notable ones: a 2x2 grid with 512px overlap, RoPE offsets per tile **on**, euler
 
 ## License
 
-Not yet chosen.
+MIT. See [LICENSE](LICENSE).
