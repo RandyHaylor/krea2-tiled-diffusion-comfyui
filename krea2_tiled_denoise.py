@@ -17,6 +17,9 @@ import torch
 
 from krea2_rope_tile_offset import TileRopeOffsetHolder
 from krea2_tile_planning import LatentTilePlan, raised_cosine_taper
+from krea2_tile_vision_substitution import (
+    substitute_tile_conditioning_for_positive_rows,
+)
 
 
 def build_tile_fusion_weight(tile_height: int, tile_width: int, latent_rank: int,
@@ -42,14 +45,19 @@ def build_tile_fusion_weight(tile_height: int, tile_width: int, latent_rank: int
 def denoise_latent_as_fused_tiles(apply_model, latent: torch.Tensor,
                                   timestep, conditioning: dict,
                                   plan: LatentTilePlan,
-                                  rope_offset_holder: TileRopeOffsetHolder | None
+                                  rope_offset_holder: TileRopeOffsetHolder | None,
+                                  cond_or_uncond: list[int] | None = None,
+                                  conditioning_per_tile: list | None = None
                                   ) -> torch.Tensor:
     """One denoise step, run per tile and fused under the raised cosine.
 
-    `conditioning` is passed to every tile unchanged. Unlike the runtime, there is
-    nothing here to crop per tile: ComfyUI composites the init latent and the
-    denoise mask around apply_model rather than inside it, and Krea2's conditioning
-    is text embeddings that are not tied to a region.
+    Without `conditioning_per_tile` the same conditioning goes to every tile, which
+    describes the whole canvas rather than the tile. With it, each tile receives a
+    conditioning built from its own region, so a tile is told to draw the part of
+    the picture it actually covers.
+
+    ComfyUI composites the init latent and the denoise mask around apply_model
+    rather than inside it, so there is nothing else here to crop per tile.
     """
     if len(plan.tiles) <= 1:
         return apply_model(latent, timestep, **conditioning)
@@ -65,15 +73,20 @@ def denoise_latent_as_fused_tiles(apply_model, latent: torch.Tensor,
         (1,) * (latent.ndim - 2) + tuple(latent.shape[-2:]),
         device=latent.device, dtype=accumulation_dtype)
 
-    for tile in plan.tiles:
+    for tile_index, tile in enumerate(plan.tiles):
         rows = slice(tile.row_start, tile.row_start + tile.height)
         columns = slice(tile.column_start, tile.column_start + tile.width)
+
+        conditioning_for_this_tile = conditioning
+        if conditioning_per_tile is not None and cond_or_uncond is not None:
+            conditioning_for_this_tile = substitute_tile_conditioning_for_positive_rows(
+                conditioning, cond_or_uncond, conditioning_per_tile[tile_index])
 
         if rope_offset_holder is not None:
             rope_offset_holder.set_to_tile_origin(tile.row_start, tile.column_start)
         try:
             tile_prediction = apply_model(latent[..., rows, columns],
-                                          timestep, **conditioning)
+                                          timestep, **conditioning_for_this_tile)
         finally:
             if rope_offset_holder is not None:
                 rope_offset_holder.clear()
@@ -88,7 +101,8 @@ def denoise_latent_as_fused_tiles(apply_model, latent: torch.Tensor,
 
 
 def build_tiled_denoise_wrapper(plan: LatentTilePlan,
-                                rope_offset_holder: TileRopeOffsetHolder | None):
+                                rope_offset_holder: TileRopeOffsetHolder | None,
+                                conditioning_per_tile: list | None = None):
     """The callable ComfyUI installs with set_model_unet_function_wrapper."""
     def tiled_denoise_wrapper(apply_model, arguments: dict) -> torch.Tensor:
         return denoise_latent_as_fused_tiles(
@@ -97,6 +111,8 @@ def build_tiled_denoise_wrapper(plan: LatentTilePlan,
             arguments["timestep"],
             arguments["c"],
             plan,
-            rope_offset_holder)
+            rope_offset_holder,
+            arguments.get("cond_or_uncond"),
+            conditioning_per_tile)
 
     return tiled_denoise_wrapper

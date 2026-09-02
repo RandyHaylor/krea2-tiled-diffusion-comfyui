@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from krea2_tile_planning import (  # noqa: E402
     LATENT_SCALE,
+    TILE_GRIDS,
     actual_overlap_between_tiles,
     parse_tile_grid,
     plan_latent_tiles,
@@ -131,6 +132,12 @@ def main() -> int:
           and single.tiles[0].width == 64 and single.tiles[0].height == 64,
           f"got {single.tiles}")
 
+    # The grid is a promise: a 2x1 must be two tiles whatever overlap is asked
+    # for. An axis holding a single tile has no overlap to report, which must not
+    # be read as "the requested overlap was unachievable" for the OTHER axis.
+    check("the plan always has exactly the requested columns and rows",
+          *plan_always_matches_the_requested_grid())
+
     if failures:
         print(f"\n{len(failures)} failing checks:")
         for failed in failures:
@@ -138,6 +145,28 @@ def main() -> int:
         return 1
     print("\nall krea2 tile planning checks passed")
     return 0
+
+
+def plan_always_matches_the_requested_grid() -> tuple[bool, str]:
+    """Every supported grid, over awkward canvases and the whole overlap range."""
+    canvas_latent_sizes = [(128, 128), (104, 152), (156, 228), (97, 131), (64, 200),
+                           (32, 32), (16, 300), (255, 255), (40, 41)]
+    overlaps_pixels = [8, 32, 64, 128, 256, 512, 1024, 2048]
+
+    for latent_width, latent_height in canvas_latent_sizes:
+        for tile_grid in TILE_GRIDS:
+            for overlap_pixels in overlaps_pixels:
+                requested_columns, requested_rows = parse_tile_grid(tile_grid)
+                plan = plan_latent_tiles(latent_width=latent_width,
+                                         latent_height=latent_height,
+                                         tile_grid=tile_grid,
+                                         tile_overlap_pixels=overlap_pixels)
+                if (plan.columns, plan.rows) != (requested_columns, requested_rows):
+                    return False, (f"{latent_width}x{latent_height} latent, grid "
+                                   f"{tile_grid}, overlap {overlap_pixels} planned "
+                                   f"{plan.columns}x{plan.rows} "
+                                   f"({len(plan.tiles)} tiles)")
+    return True, ""
 
 
 def covers_every_position(tiles, width: int, height: int) -> bool:

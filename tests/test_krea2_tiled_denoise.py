@@ -27,6 +27,39 @@ from krea2_tiled_denoise import (  # noqa: E402
 failures: list[str] = []
 
 
+def record_the_conditioning_each_tile_receives(plan, conditioning_per_tile):
+    """Run the fused loop with a stub model, returning what each tile was given."""
+    received = []
+
+    def record_and_return_zeros(tile, timestep, **conditioning):
+        received.append(conditioning["c_crossattn"].clone())
+        return torch.zeros_like(tile)
+
+    latent = torch.zeros(1, 4, plan.tiles[0].height + plan.tiles[-1].row_start,
+                         plan.tiles[0].width + plan.tiles[-1].column_start)
+    denoise_latent_as_fused_tiles(
+        record_and_return_zeros, latent, timestep=None,
+        conditioning={"c_crossattn": torch.zeros(1, 6, 8)}, plan=plan,
+        rope_offset_holder=None, cond_or_uncond=[0],
+        conditioning_per_tile=conditioning_per_tile)
+    return received
+
+
+def every_tile_receives_its_own_conditioning(plan) -> bool:
+    conditioning_per_tile = [[[torch.full((1, 6, 8), float(index)), {}]]
+                             for index in range(len(plan.tiles))]
+    received = record_the_conditioning_each_tile_receives(plan, conditioning_per_tile)
+    if len(received) != len(plan.tiles):
+        return False
+    return all(float(embedding.max()) == float(index)
+               for index, embedding in enumerate(received))
+
+
+def every_tile_receives_the_same_conditioning(plan) -> bool:
+    received = record_the_conditioning_each_tile_receives(plan, None)
+    return all(torch.equal(embedding, received[0]) for embedding in received)
+
+
 def check(description: str, passed: bool, detail: str = "") -> None:
     print(f"{'PASS' if passed else 'FAIL'}: {description}{(' ' + detail) if detail else ''}")
     if not passed:
@@ -172,6 +205,11 @@ def main() -> int:
     check("a failing model still leaves the rope offset cleared",
           (holder.row_offset_tokens, holder.column_offset_tokens) == (0, 0),
           f"got {holder.row_offset_tokens}, {holder.column_offset_tokens}")
+
+    check("each tile is given its OWN conditioning when per-tile vision is supplied",
+          every_tile_receives_its_own_conditioning(plan))
+    check("without per-tile vision every tile still shares one conditioning",
+          every_tile_receives_the_same_conditioning(plan))
 
     if failures:
         print(f"\n{len(failures)} failing checks:")

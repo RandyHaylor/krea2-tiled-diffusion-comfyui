@@ -23,6 +23,13 @@ from dataclasses import dataclass
 
 LATENT_SCALE = 8
 
+# The geometry widgets, shared by the sampler and the encoder so a workflow cannot
+# offer one set of grids in one node and a different set in the other.
+TILE_GRIDS = ["1x1", "1x2", "2x1", "2x2", "2x3", "3x2", "3x3"]
+# From the reference generations. See DESIGN.md for the two recipes.
+DEFAULT_TILE_GRID = "2x2"
+DEFAULT_TILE_OVERLAP_PIXELS = 256
+
 # stable-diffusion.cpp:3065. Without this floor the outermost row and column of a
 # tile weigh exactly zero, and a canvas pixel covered only by tile edges would
 # have nothing to divide by.
@@ -131,18 +138,28 @@ def plan_latent_tiles(latent_width: int, latent_height: int, tile_grid: str,
     tile_height_pixels = tile_size_covering_length(
         canvas_height_pixels, rows, tile_overlap_pixels)
 
-    overlap_pixels = min(
-        actual_overlap_between_tiles(canvas_width_pixels, tile_width_pixels, columns),
-        actual_overlap_between_tiles(canvas_height_pixels, tile_height_pixels, rows))
-    if overlap_pixels <= 0:
-        overlap_pixels = int(tile_overlap_pixels)
+    column_overlap_pixels = actual_overlap_between_tiles(
+        canvas_width_pixels, tile_width_pixels, columns)
+    row_overlap_pixels = actual_overlap_between_tiles(
+        canvas_height_pixels, tile_height_pixels, rows)
 
     tile_width = tile_width_pixels // LATENT_SCALE
     tile_height = tile_height_pixels // LATENT_SCALE
-    overlap = max(1, overlap_pixels // LATENT_SCALE)
 
-    column_starts = tile_start_positions_covering_length(latent_width, tile_width, overlap)
-    row_starts = tile_start_positions_covering_length(latent_height, tile_height, overlap)
+    # Each axis is spread using ITS OWN overlap. An axis holding a single tile
+    # reports no overlap, which says nothing about the other axis: sharing one
+    # figure between them lets a 1xN grid collapse to a one cell stride and plan
+    # dozens of tiles for a grid that promised two.
+    column_starts = tile_start_positions_covering_length(
+        latent_width, tile_width, max(1, column_overlap_pixels // LATENT_SCALE))
+    row_starts = tile_start_positions_covering_length(
+        latent_height, tile_height, max(1, row_overlap_pixels // LATENT_SCALE))
+
+    # One overlap is reported, as the runtime reports one. Axes with a single tile
+    # have none to contribute.
+    shared_overlaps = [overlap for overlap in (column_overlap_pixels, row_overlap_pixels)
+                       if overlap > 0]
+    overlap = max(1, min(shared_overlaps) // LATENT_SCALE) if shared_overlaps else 1
 
     return LatentTilePlan(
         tiles=[LatentTile(column_start=column_start,

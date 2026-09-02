@@ -666,3 +666,20 @@ Acceptance is visual, on crops, at the reference settings. Not a seam metric.
     PNG metadata writing
     the queue, the web UI, the tunnel
     pixel-space tiling of any kind
+
+=== Wishlist, Not Being Built ===
+
+Worth doing later, recorded so the reasoning is not lost. None of this is started.
+
+    A per-tile prompt visualiser: draw the tile rectangles over the reference
+    image so a user can see which region each row/col prompt field governs. The
+    fields are a fixed 3x3 grid, so at smaller grids it is not obvious by eye
+    which fields are live.
+
+    Filling the per-tile prompt fields automatically, by captioning each crop
+    with BLIP or tagging it with WD14. The crops already exist at encode time,
+    so the hook is cheap; the cost is a dependency on another model.
+
+    Dynamic prompt fields that appear and disappear with the selected grid. This
+    IS possible in ComfyUI, but it pulls in frontend interaction machinery that
+    buys nothing here: nine static fields cover every supported grid.
