@@ -1,114 +1,116 @@
-# krea2-tiled-diffusion-comfyui
+# Krea 2 Tiled Diffusion
 
 ![The two nodes](docs/images/krea2_tiled_diffusion_the_two_nodes.png)
 
-Two ComfyUI nodes for Krea 2. One denoises a latent as overlapping tiles **fused
-every step**. The other gives every tile **its own conditioning**, built from the
-region that tile will actually draw.
+**High-resolution detail passes for Krea 2 that don't grow a second head — and run on consumer VRAM.**
 
-## What makes this different
+The model only ever sees one tile, so peak memory follows the **tile**, not the
+canvas. Need a bigger image? Raise the grid, not the VRAM.
 
-**The tiles are fused inside every sampling step**, under a raised cosine weight,
-before the step returns. Most tile-based upscaling denoises each tile to
-completion and blends the finished tiles afterwards. Because neighbouring tiles
-here are recombined at each step, they cannot drift apart and invent conflicting
-content — a pixel blend of independently finished tiles cannot repair that
-divergence after the fact.
+---
 
-**Every tile gets its own vision tokens.** The text encoder's vision tower reads
-the crop that tile covers, not the whole picture. Conditioning a tile on the
-entire composition is what tells each tile to draw the entire composition, which
-is how tiled passes grow a second head or a spare pair of legs. Vision cannot be
-attached to an already-encoded conditioning, so each tile's crop and text go
-through the encoder together, in one pass.
+## Why it holds together
 
-**Per-tile prompt text.** Alongside the global prompt, each tile has its own
-field. The global prompt should hold only what is true of *every* tile — style,
-medium, palette — because it is asked for in every tile. Subject matter that
-appears in one region belongs in that region's field.
+**Tiles fuse every step.** Others denoise each tile to completion, then blend the
+finished tiles — too late, they already disagreed. Here all tiles run the *same*
+step and recombine before it returns, under a raised cosine weight. Neighbours
+can't drift because neither gets ahead.
 
-The approach was developed and measured in a
-[llama.cpp-style local Krea 2 runtime](https://github.com/RandyHaylor/stable-diffusion-krea-2-convrot-tinyserver),
-where a per-finished-tile implementation was built, compared against this one,
-lost twice, and was deleted.
+**Each tile sees only its own region.** The vision tower reads that tile's crop.
+Show a tile the whole composition and you've told it to *draw* the whole
+composition — that's where the spare torso comes from.
 
-## Example
+**The prompt barely matters.** Content arrives through vision, so you don't
+describe the image. This is a complete working prompt for a picture of a person,
+two katanas, sneakers and blocks of text:
 
-A 2x2 pass at 2048², four steps, with per-tile vision. Left is the input, right
-is the result.
+```
+a black and white image in a high quality drawing style
+```
+
+Whatever you put in the global prompt is asked of *every* tile — keep it to
+medium, palette, style.
+
+---
+
+## Results
+
+2x2 at 2048², four steps. Input left, output right.
 
 | before | after |
 |--------|-------|
 | ![before](docs/images/puppy_before_tiled_diffusion.png) | ![after](docs/images/puppy_after_tiled_diffusion.png) |
 
-## The workflow
+---
+
+## Recipes
+
+| | **detail pass** | **rebuild** | **low VRAM** |
+|---|---|---|---|
+| grid | 2x2 | 2x2 | 3x3 |
+| overlap | 256px | 256px | 256px |
+| steps | 4 | 8 | 4 |
+| denoise | 0.10 | 0.75 | 0.10 |
+| evals / step | 4 | 4 | 9 |
+| | sharpens what's there | redraws at high res | smaller tiles, bigger canvas |
+
+Shared: **euler**, **simple**, cfg **1**, RoPE offsets **on**. Turbo model or LoRA.
+
+`vision_weight` **1.0** is enough; up to **8.0** tightens adherence. Both usable.
+
+Pick a denoise — 0.10 and 0.75 are different jobs, the middle is worse than either.
+
+Overlap can go far below 256. Per-tile vision holds one coherent figure at **32px**
+seams, where whole-image conditioning splits the same seed into three figures.
+
+---
+
+## Workflow
 
 ![Example workflow](docs/images/krea2_tiled_diffusion_example_workflow.png)
 
 [`workflows/krea2 tiled diffusion.json`](workflows/krea2%20tiled%20diffusion.json)
-is ready to open. The shape that matters:
+opens and runs.
 
 ```
-Load Image ─┬─> Upscale Image ─┬─> VAE Encode ──> Krea2 Tiled Diffusion (latent)
-            │                  │
-            └──────────────────┴─> Krea2-Qwen3 Encoder (reference_image)
-                                        └─> tile_vision ──> Krea2 Tiled Diffusion
-Empty CLIPTextEncode ────────────────────────────────────> Krea2 Tiled Diffusion (negative)
+Load Image ──> Upscale ──┬──> VAE Encode ──> Tiled Diffusion (latent)
+                         └──> Encoder (reference_image) ──> tile_vision ──┘
+Empty CLIPTextEncode ────────────────────────> Tiled Diffusion (negative)
 ```
 
-Three rules the wiring has to follow:
+1. **`reference_image` and the latent are the same pixels** — feed both from one
+   node, after any resizing.
+2. **Leave `positive` unwired.** Each tile brings its own conditioning.
+3. **`negative` is required** — an empty `CLIPTextEncode`.
 
-1. **`reference_image` and the latent must be the same pixels.** The encoder
-   crops that image to find each tile; the sampler tiles the latent. Feed both
-   from the same node, after any resizing.
-2. **`positive` is left unwired** when `tile_vision` is connected. Each tile
-   brings its own conditioning, so a separate positive has nothing to do. It
-   exists for workflows that do not use our encoder at all.
-3. **`negative` is required**, normally an empty `CLIPTextEncode`.
+Set `tile_grid` and `tile_overlap` on the **encoder**; the sampler adopts them.
 
-The sampler takes `tile_grid` and `tile_overlap` **from the bundle** when one is
-wired — its own widgets are ignored, because the crops were already made against
-the encoder's geometry. Set them on the encoder.
+**Stays in latent space.** No resizing, cropping, or VAE in either node — latent
+in at target resolution, latent out. Drops straight into a hires chain with no
+pixel round trip. ComfyUI's own nodes handle upscaling and encoding.
 
-The nodes never resize, crop, or touch a VAE. They expect a latent already at the
-target resolution; ComfyUI's own nodes do the upscaling and encoding.
-
-## Two recipes
-
-The settings come from real generations, not from taste. There are **two** that
-work, and they are different jobs rather than two points on one scale — the
-middle ground between them is worse than either end.
-
-|                | **High denoise** (default) | **Low denoise** |
-|----------------|---------------------------|-----------------|
-| what it does   | builds a new high-res image | enhances what is already there |
-| grid           | 2x2                       | 3x3             |
-| overlap        | 256px                     | 512px           |
-| steps          | 8                         | 4               |
-| denoise        | 0.75                      | 0.10            |
-
-Shared by both: **euler** + **simple**, cfg **1**, flow shift **1.15**, RoPE
-offsets per tile **on**. Either wants a turbo model or a turbo LoRA.
-
-Do not split the difference on denoise. Pick a recipe.
-
-Those overlap figures predate per-tile vision. With each tile conditioned on its
-own region, smaller overlaps hold together where they previously fell apart —
-`DESIGN.md` records what has and has not been measured.
+---
 
 ## Per-tile prompts
 
-The prompt fields are a fixed 3x3 grid, so their row and column labels stay
-meaningful whatever tile grid is chosen. A 2x2 run reads fields (1,1), (1,2),
-(2,1) and (2,2); the rest are ignored.
+Nine fields on a fixed 3x3 grid, so labels stay readable at any tile grid — a 2x2
+uses `(1,1) (1,2) (2,1) (2,2)`.
 
-Each tile is encoded with `global prompt, tile prompt` together with its own crop.
+Each tile encodes `global prompt, tile prompt` with its own crop, in one pass.
+Put `bright green eye` in one field and only that quadrant hears it.
+
+---
 
 ## Requirements
 
-- A ComfyUI build with native Krea 2 support (`comfy/ldm/krea2/`)
-- A turbo model or turbo LoRA, supplied by you
-- The identity edit LoRA loads in-node
+- ComfyUI with native Krea 2 support (`comfy/ldm/krea2/`)
+- **Diffusion model** — `krea2TurboRawINT8_krea2TurboINT8` (INT8, ~12 GB) runs
+  well. A base Krea 2 model plus a turbo LoRA (`krea2_raw_to_turbo_r256`) also
+  works.
+- **Text encoder** — `qwen3vl4bInt8W4a8_int8convrot` (~5 GB). Smaller quantised
+  qwen3vl_4b builds are fine.
+- **Identity edit LoRA**, optional, loads in-node — the smallest v1.2 rank,
+  `krea2_identity_edit_v1_2_r64` (~436 MB), works well.
 
 ## License
 
