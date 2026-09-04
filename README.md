@@ -20,17 +20,14 @@ can't drift because neither gets ahead.
 Show a tile the whole composition and you've told it to *draw* the whole
 composition — that's where the spare torso comes from.
 
-**The prompt barely matters.** Content arrives through vision, so you don't
-describe the image. This is a complete working prompt for a picture of a person,
-two katanas, sneakers and blocks of text:
+**The prompt matters.** Per-tile content arrives through vision, so you can't
+describe all aspects of the image in the main prompt. There are fields per tile 
+you can use to correct issues that arise, but generally you should only put 
+style/quality prompting that applies to all tiles:
 
 ```
 a black and white image in a high quality drawing style
 ```
-
-Whatever you put in the global prompt is asked of *every* tile — keep it to
-medium, palette, style.
-
 ---
 
 ## Results
