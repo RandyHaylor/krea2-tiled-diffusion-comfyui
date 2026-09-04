@@ -2,10 +2,14 @@
 
 ![The two nodes](docs/images/krea2_tiled_diffusion_the_two_nodes.png)
 
-**High-resolution detail passes for Krea 2 that don't grow a second head — and run on consumer VRAM.**
+**High-resolution detail passes for Krea 2 that don't hallucinate and run on consumer VRAM.**
 
 The model only ever sees one tile, so peak memory follows the **tile**, not the
 canvas. Need a bigger image? Raise the grid, not the VRAM.
+
+Higher than 2mp images possible, plus 2mp details are greatly enhanced
+
+1024px > 2048px in 2x2 tiling with 256/512px overlap shines
 
 ---
 
